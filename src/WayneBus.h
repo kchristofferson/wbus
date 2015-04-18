@@ -8,6 +8,8 @@
 #ifndef WAYNEBUS_H_
 #define WAYNEBUS_H_
 
+#include <stdint.h>
+
 namespace ur {
 
 const unsigned int BUF_SIZE = 1024;
@@ -28,7 +30,7 @@ const uint8_t REGISTER_HALT = 0x02;
 const uint8_t REGISTER_PWM_LEFT = 0x03;
 const uint8_t REGISTER_PWM_RIGHT = 0x04;
 const uint8_t REGISTER_SPEED_LEFT = 0x07;
-const uint8_t REGISTER_SPEED_RUGHT = 0x08;
+const uint8_t REGISTER_SPEED_RIGHT = 0x08;
 const uint8_t REGISTER_RAMP_LEFT = 0x09;
 const uint8_t REGISTER_RAMP_RIGHT = 0x0A;
 const uint8_t REGISTER_TICS_LEFT = 0x0B;
@@ -83,39 +85,46 @@ struct message {
 	uint8_t crc8;
 };
 
+extern boost::asio::serial_port g_port;
+
 class WayneBus {
 public:
-	WayneBus();
+	WayneBus(boost::asio::io_service& ios);
 	virtual ~WayneBus();
 
-	virtual bool start(const char *com_port_name, int baud_rate=9600, int charsize, int stop=1, char parity='n', char flow='n');
+	virtual bool start(const char *com_port_name,
+	                   int baud_rate=9600,
+	                   int charsize=8,
+	                   int stop=1,
+                     boost::asio::serial_port::parity::type parity=boost::asio::serial_port::parity::none,
+                     boost::asio::serial_port::flow_control::type flow=boost::asio::serial_port::flow_control::none);
 	virtual void stop();
 
 	int write_board(message msg);
-	int write_board(const char *buf, const int &size);
+//	int write_board(const char *buf, const int &size);
 
 
 protected:
 	boost::asio::io_service io_service_;
 	boost::thread *tlb_ptr;
 	boost::thread *tln_ptr;
-	boost::shared_ptr<boost::asio::serial_port> port_;
 	boost::mutex mutex_;
 
-	std::list<ur::message> cmd_queue;  // Inbound queue from one or more software nodes
+	std::vector<ur::message> cmd_queue;  // Inbound queue from one or more software nodes
     boost::mutex mutex_cmd;
-	std::list<ur::message> odom_queue; // Outbound queue to software node supporting navigation and odometry
+	std::vector<ur::message> odom_queue; // Outbound queue to software node supporting navigation and odometry
     boost::mutex mutex_odom;
-	std::list<ur::message> diag_queue; // Outbound queue to sofware node supporting diagnostics
+	std::vector<ur::message> diag_queue; // Outbound queue to sofware node supporting diagnostics
     boost::mutex mutex_diag;
 
 	char read_buf_raw_[BUF_SIZE];
 
-	virtual void listen_board(void);
+	virtual void listen_board(const boost::system::error_code& error, std::size_t transferred);
 	virtual void on_cmd_queue(void);
 	virtual void on_board_message(message msg);
 
 private:
+	boost::asio::serial_port m_port;
 
 };
 

@@ -8,6 +8,7 @@
  *
  */
 
+#include <boost/exception.hpp>
 #include <boost/asio/io_service.hpp>
 #include <boost/asio/ip/udp.hpp>
 #include <boost/asio/signal_set.hpp>
@@ -17,26 +18,32 @@
 #include <boost/bind.hpp>
 #include <ctime>
 #include <iostream>
+#include <fstream>
 #include <syslog.h>
 #include <unistd.h>
 
 #include "WayneBus.h"
+
+// global variables
 
 int main(int argc, char *argv[])
 {
 	unsigned int baud_rate_;
 	unsigned int char_size_;
 	unsigned int stop_bits_;
-	char parity_;
-	char flow_control_;
+	std::string parity_;
+	boost::asio::serial_port::parity::type parity;
+	std::string flow_control_;
+	boost::asio::serial_port::flow_control::type flow_control;
 	std::string device_name_;
+  boost::program_options::variables_map vm;
+  std::string sCfgFile = "/etc/wbusd/wbusd.conf";
 
-    boost::asio::io_service io_service;
-    ur::WayneBus server(io_service);
+  boost::asio::io_service io_service;
+  ur::WayneBus server(io_service);
 
 	try
 	{
-	variables_map vm;
 
 	// Pick up parameters
 	// command line
@@ -49,29 +56,33 @@ int main(int argc, char *argv[])
 	// config file
 	boost::program_options::options_description config("Configuration");
 	config.add_options()
-    ("baud", boost::program_options::value<int>(&opt)->default_value(115200), "baud rate")
-    ("size", boost::program_options::value<int>(&opt)->default_value(8), "character size")
-    ("stopbits", boost::program_options::value<int>(&opt)->default_value(1), "Number of stop bits")
-    ("parity", boost::program_options::value<char>(&opt)->default_value("n"), "Parity - (n)one, (o)dd, or (e)ven")
-    ("flow", boost::program_options::value<char>(&opt)->default_value("n"), "Flow control - (n)one, (s)oftware, or (h)ardware")
+    ("baud", boost::program_options::value<int>()->default_value(115200), "baud rate")
+    ("size", boost::program_options::value<int>()->default_value(8), "character size")
+    ("stopbits", boost::program_options::value<int>()->default_value(1), "Number of stop bits")
+    ("parity", boost::program_options::value<std::string>()->default_value("n"), "Parity - (n)one, (o)dd, or (e)ven")
+    ("flow", boost::program_options::value<std::string>()->default_value("n"), "Flow control - (n)one, (s)oftware, or (h)ardware")
     ("device", boost::program_options::value<std::string>(), "Device name for the bus board")
 	;
 
-	po::options_description cmdline_options;
+	boost::program_options::options_description cmdline_options;
 	cmdline_options.add(generic);
 
-	po::options_description config_file_options;
-	config_file_options.add(config);
+	boost::program_options::options_description config_options;
+	config_options.add(config);
 
 	boost::program_options::store(parse_command_line(argc, argv, cmdline_options), vm);
-	boost::program_options::store(parse_config_file("/etc/wbus/wbus.conf", config_file_options), vm);
 
+  std::ifstream cfgfile(sCfgFile.c_str(), std::ios::in);
+  if (cfgfile.fail())
+    syslog(LOG_ERR | LOG_USER, "wbusd failed to open the configuration file \"%s\"", sCfgFile.c_str());
+	boost::program_options::store(parse_config_file(cfgfile, config_options, true), vm);
+	cfgfile.close();
 
 	boost::program_options::notify(vm);
 	}
 	catch (boost::system::error_code &e)
 	{
-        syslog(LOG_ERR | LOG_USER, "Read configuration failed: %m", e.what());
+        syslog(LOG_ERR | LOG_USER, "wbusd obtaining configuration failed: %m", e.message());
         return 1;
 	}
 
@@ -83,19 +94,33 @@ int main(int argc, char *argv[])
 		baud_rate_ = (unsigned int) vm["baud"].as<int>();
 		char_size_ = (unsigned int) vm["size"].as<int>();
 		stop_bits_ = (unsigned int) vm["stopbits"].as<int>();
-		parity_ = (unsigned int) vm["parity"].as<char>();
-		flow_control_ = (unsigned int) vm["parity"].as<char>();
+
+		parity_ = vm["parity"].as<std::string>();
+		if ( parity_.compare(0,1,"e") == 0 || parity_.compare(0,1,"E") == 0 )
+		  parity = boost::asio::serial_port::parity::even;
+		else if ( parity_.compare(0,1,"o") == 0 || parity_.compare(0,1,"O") == 0 )
+      parity = boost::asio::serial_port::parity::odd;
+		else  // If config file is messed up, accept no parity
+      parity = boost::asio::serial_port::parity::none;
+
+		flow_control_ = vm["parity"].as<std::string>();
+    if ( flow_control_.compare(0,1,"s") == 0 || flow_control_.compare(0,1,"S") == 0 )
+      flow_control = boost::asio::serial_port::flow_control::software;
+    else if ( flow_control_.compare(0,1,"h") == 0 || flow_control_.compare(0,1,"H") == 0 )
+      flow_control = boost::asio::serial_port::flow_control::hardware;
+    else  // If config file is messed up, accept no flow control
+      flow_control = boost::asio::serial_port::flow_control::none;
 	}
 	catch (boost::system::error_code& e)
 	{
-        syslog(LOG_ERR | LOG_USER, "Invalid configuration: %m", e.what());
+        syslog(LOG_ERR | LOG_USER, "Invalid configuration: %m", e.message());
         return 1;
 	}
 
 	// become a daemon
 	  try
 	  {
-	    boost::asio::signal_set signals(, SIGINT, SIGTERM);
+	    boost::asio::signal_set signals(io_service, SIGINT, SIGTERM);
 	    signals.async_wait(
 	        boost::bind(&boost::asio::io_service::stop, &io_service));
 
@@ -222,7 +247,7 @@ int main(int argc, char *argv[])
 
       //Create an interprocess queue to accept commands.
       boost::interprocess::message_queue mq_odom
-         (create_only               //only create
+         (boost::interprocess::create_only               //only create
          ,"ur_cmd_queue"            //name
          ,500                       //max message number
          ,sizeof(ur::message)       //max message size
@@ -230,7 +255,7 @@ int main(int argc, char *argv[])
 
       //Create an interprocess queue to pass odometry.
       boost::interprocess::message_queue mq_odom
-         (create_only               //only create
+         (boost::interprocess::create_only               //only create
          ,"ur_odom_queue"              //name
          ,100                       //max message number
          ,sizeof(ur::message)       //max message size
@@ -238,7 +263,7 @@ int main(int argc, char *argv[])
 
       //Create an interprocess queue to pass diagnostics.
       boost::interprocess::message_queue mq_diag
-         (create_only               //only create
+         (boost::interprocess::create_only               //only create
          ,"ur_diag_queue"              //name
          ,100                       //max message number
          ,sizeof(ur::message)       //max message size
@@ -246,20 +271,20 @@ int main(int argc, char *argv[])
 
       //Create an interprocess queue to pass sonar information.
       boost::interprocess::message_queue mq_sonar
-         (create_only               //only create
+         (boost::interprocess::create_only               //only create
          ,"ur_sonar_queue"              //name
          ,100                       //max message number
          ,sizeof(ur::message)       //max message size
          );
 	   }
-	   catch(interprocess_exception &e){
+	   catch(boost::interprocess::interprocess_exception &e){
          syslog(LOG_ERR | LOG_USER, "Exception: %s", e.what());
          std::cerr << "Exception: " << e.what() << std::endl;
          return 1;
 	   }
 
 	// open the device rw
-	  server.start(device_name_, baud_rate_, char_size_, stop_bits_, parity_, flow_control_);
+	  server.start(device_name_.c_str(), baud_rate_, char_size_, stop_bits_, parity, flow_control);
 
 	// loop
 

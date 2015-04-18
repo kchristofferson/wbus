@@ -7,124 +7,92 @@
 
 #include <endian.h>
 #include <syslog.h>
+#include <stdint.h>
+#include <boost/asio/io_service.hpp>
+#include <boost/asio/serial_port.hpp>
+#include <boost/asio/placeholders.hpp>
+#include <boost/interprocess/ipc/message_queue.hpp>
+#include <boost/thread.hpp>
 
 #include "WayneBus.h"
 #include "CRC.h"
 
 namespace ur {
 
-WayneBus::WayneBus(boost::asio::io_service ios) :
-		io_service_(ios),
-		tlb_ptr(new boost::thread *),
-		tln_ptr(new boost::thread *)
+WayneBus::WayneBus(boost::asio::io_service& ios) :
+		m_port(ios)
 {
 	// TODO Auto-generated constructor stub
+  tlb_ptr = new boost::thread;
+  tln_ptr = new boost::thread;
 }
 
 WayneBus::~WayneBus()
 {
-	// TODO Auto-generated destructor stub
+  // TODO Auto-generated destructor stub
+
+  boost::system::error_code ec;
 
 	boost::mutex::scoped_lock look(mutex_);
+	m_port.cancel();
+ 	m_port.close();
+	io_service_.stop();
+	io_service_.reset();
 
-		if (port_) {
-			port_->cancel();
-			port_->close();
-			port_.reset();
-		}
-		io_service_.stop();
-		io_service_.reset();
-
-		~tlb_ptr;
-		~tln_ptr;
+	delete tlb_ptr;
+	delete tln_ptr;
 }
 
-bool WayneBus::start(const char *com_port_name, int baud_rate=9600, int charsize, int stop=1, char parity='n', char flow='n')
+bool WayneBus::start(const char *com_port_name,
+                     int baud_rate,
+                     int charsize,
+                     int stop,
+                     boost::asio::serial_port::parity::type parity,
+                     boost::asio::serial_port::flow_control::type flow)
 {
 	boost::system::error_code ec;
 
-	// connect once and only once
-	if ( port_ ) {
-        syslog(LOG_ERR | LOG_USER, "Attempted to open connection that is already open.\n");
-		return false;
-	}
-
-	// connect to the motor controller
-	port_ = serial_port_ptr(new boost::asio::serial_port(io_service_));
-	port_->open(com_port_name, ec);
+	// connect to the motor controll
+	m_port.open(com_port_name, ec);
 	if ( ec ) {
-        syslog(LOG_ERR | LOG_USER, "port_->open() failed...com_port_name= \"%s\"\n", com_port_name);
+        syslog(LOG_ERR | LOG_USER, "m_port.open() failed...com_port_name= \"%s\"\n", com_port_name);
 		return false;
 	}
 
 	// option settings...
-	port_->set_option(boost::asio::serial_port_base::baud_rate(baud_rate));
-	port_->set_option(boost::asio::serial_port_base::character_size(charsize));
+	m_port.set_option(boost::asio::serial_port_base::baud_rate(baud_rate));
+	m_port.set_option(boost::asio::serial_port_base::character_size(charsize));
 	if ( stop == 1 )
-      port_->set_option(boost::asio::serial_port_base::stop_bits(boost::asio::serial_port_base::stop_bits::one));
+      m_port.set_option(boost::asio::serial_port_base::stop_bits(boost::asio::serial_port_base::stop_bits::one));
 	else if ( stop == 2 )
-	  port_->set_option(boost::asio::serial_port_base::stop_bits(boost::asio::serial_port_base::stop_bits::two));
+	  m_port.set_option(boost::asio::serial_port_base::stop_bits(boost::asio::serial_port_base::stop_bits::two));
 	else
 	{
-        syslog(LOG_ERR | LOG_USER, "port_->open() configuration failed...invalid stopbit setting = \"%d\"\n", stop);
+        syslog(LOG_ERR | LOG_USER, "m_port.open() configuration failed...invalid stopbit setting = \"%d\"\n", stop);
 		return false;
 	}
-	switch ( parity )
-	{
-	case 'n' :
-	case 'N' :
-		port_->set_option(boost::asio::serial_port_base::parity(boost::asio::serial_port_base::parity::none));
-		break;
-	case 'o' :
-	case 'O' :
-		port_->set_option(boost::asio::serial_port_base::parity(boost::asio::serial_port_base::parity::odd));
-		break;
-	case 'e' :
-	case 'E' :
-		port_->set_option(boost::asio::serial_port_base::parity(boost::asio::serial_port_base::parity::even));
-		break;
-	default:
-        syslog(LOG_ERR | LOG_USER, "port_->open() configuration failed...invalid parity setting = \"%c\"\n", parity);
-		return false;
-		break;
-	}
-	switch ( flow )
-	{
-	case 'n' :
-	case 'N' :
-		port_->set_option(boost::asio::serial_port_base::flow_control(boost::asio::serial_port_base::flow_control::none));
-		break;
-	case 'h' :
-	case 'H' :
-		port_->set_option(boost::asio::serial_port_base::flow_control(boost::asio::serial_port_base::flow_control::hardware));
-		break;
-	case 's' :
-	case 'S' :
-		port_->set_option(boost::asio::serial_port_base::flow_control(boost::asio::serial_port_base::flow_control::software));
-		break;
-	default:
-        syslog(LOG_ERR | LOG_USER, "port_->open() configuration failed...invalid flow control setting = \"%c\"\n", flow);
-		return false;
-		break;
-	}
+	m_port.set_option(boost::asio::serial_port_base::parity(parity));
+	m_port.set_option(boost::asio::serial_port_base::flow_control(flow));
 
 	// start thread to listen for messages from the board
-	boost::thread tlb(boost::bind(&ur::WayneBus::listen_board, this));
-	tlb_ptr = tlb;
+	boost::thread tlb(boost::bind(&ur::WayneBus::listen_board,
+	                              boost::asio::placeholders::error,
+                                (td::size_t) 1);
+	tlb_ptr = &tlb;
 
 	// start thread to send command messages to the board
 	boost::thread tln(boost::bind(&ur::WayneBus::on_cmd_queue, this));
-	tln_ptr = tln;
+	tln_ptr = &tln;
 
 	return true;
 }
 
-int write_board(message msg)
+int WayneBus::write_board(message msg)
 {
 	boost::system::error_code ec;
 	ur::CRC crc;
 
-	if ( !port_ ) return -1;
+	if ( !m_port.is_open() ) return -1;
 
 	// convert to big endian for the controller
 	msg.val.i = htobe32(msg.val.i);
@@ -132,48 +100,38 @@ int write_board(message msg)
 	// generate the checksum
 	msg.crc8 = crc.checksum(&msg, 1, 7);
 
-	return port_->write_some(boost::asio::buffer(&msg, sizeof(message)), ec);
+	return m_port.write_some(boost::asio::buffer(&msg, sizeof(message)), ec);
 }
 
-int write_board(const char *buf, const int &size)
-{
-	boost::system::error_code ec;
-
-		if ( !port_ ) return -1;
-		if ( size == 0 ) return 0;
-
-		return port_->write_some(boost::asio::buffer(buf, size), ec);
-}
-
-void WayneBus::listen_board(void)
+void WayneBus::listen_board(const boost::system::error_code& error, std::size_t transferred)
 {
 	struct message *msg = new message;
 	size_t fill = 0;
 
-	if (port_.get() == NULL || !port_->is_open()) return;
+	if ( !m_port.is_open() ) return;
 
     for (;; fill = 0)
     {
 	    while (fill < sizeof(message))
 	    {
-		  if (1 != 	port_->async_read_some( boost::asio::buffer(&msg + fill, 1),
-	                boost::bind(&SerialPort::on_receive_,
-		            this,
-				    boost::asio::placeholders::error,
-		            boost::asio::placeholders::bytes_transferred) ) )
+		  m_port.async_read_some(boost::asio::buffer(msg + fill, BUF_SIZE),
+	           boost::bind(&WayneBus::listen_board,
+			       boost::asio::placeholders::error,
+		         transferred));
+		  if ( transferred != 1 )
 		  {
-	        syslog(LOG_ERR | LOG_USER, "port_->async_read_some() failed...");
+	        syslog(LOG_ERR | LOG_USER, "m_port.async_read_some() failed...");
 		    return;
 		  }
 	      ++fill;
-	      if (fill == 1 && msg.delimiter != MESSAGE_DELIMITER)
+	      if (fill == 1 && msg->delimiter != MESSAGE_DELIMITER)
 	        fill = 0;
-	      else if (fill == 2 && msg.version != MESSAGE_VERSION)
+	      else if (fill == 2 && msg->version != MESSAGE_VERSION)
 	        fill = 0;
 	    }
 
 	    // have a complete message
-	    on_board_message(msg);
+	    on_board_message(*msg);
     }
 }
 
@@ -202,7 +160,7 @@ void WayneBus::on_board_message(message msg)
   case REGISTER_TICS_LEFT :
   case REGISTER_TICS_RIGHT :
 	  mutex_odom.lock();
-	  odom_queue.push(msg);
+	  odom_queue.push_back(msg);
 	  mutex_odom.unlock();
 	  break;
   case REGISTER_DEADMAN :
@@ -234,8 +192,8 @@ void WayneBus::on_board_message(message msg)
   case REGISTER_CURRENT_MAIN_12V :
   case REGISTER_CURRENT_AUX_12V :
 	  mutex_diag.lock();
-	  diag_queue.push(msg);
-	  mutex_diab.unlock();
+	  diag_queue.push_back(msg);
+	  mutex_diag.unlock();
 	  break;
   default :
 	  break;
@@ -244,21 +202,19 @@ void WayneBus::on_board_message(message msg)
 
 void WayneBus::on_cmd_queue(void)
 {
-	struct message *msg;
-
-// if named queue in heap does not exist	if (port_.get() == NULL || !port_->is_open()) return;
+  if ( !m_port.is_open() ) return;
 
     for ( ; ; )
     {
     	if ( !cmd_queue.empty() )
     	{
-    		for(std::list<ur::message>::iterator iter = cmd_queue.begin();
+    		for(std::vector<ur::message>::iterator iter = cmd_queue.begin();
     		    iter != cmd_queue.end(); iter++)
     		{
     			mutex_cmd.lock();
     		    if ( write_board(*iter) != sizeof(ur::message) )
     		        syslog(LOG_ERR | LOG_USER, "on_cmd_queue failed to write complete packet to board.\n");
-    		    cmd_queue.remove(*iter);
+    		    cmd_queue.erase(iter);
     		    mutex_cmd.unlock();
     		}
     	}
